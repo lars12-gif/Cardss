@@ -9,11 +9,53 @@ const pino = require('pino');
 const fs = require('fs');
 const path = require('path');
 
-// رقم الحساب الذي سيربط بالبوت بالصيغة الدولية بدون (+) أو أصفار بادئة
-// مثال للعراق: '9647700000000' — أو مرره عبر متغير بيئة PHONE_NUMBER
-const PHONE_NUMBER = (process.env.PHONE_NUMBER || '9647700000000').replace(/\D/g, '');
+// ==========================================
+// 1. تنظيف اللوق من ضجيج libsignal (Bad MAC / SessionEntry)
+// ==========================================
+const noisyPatterns = [
+  'Bad MAC',
+  'Failed to decrypt message',
+  'Closing session:',
+  'Session error:',
+  'libsignal/src/'
+];
 
-// 1. إعداد قاعدة البيانات الدائمة (SQLite)
+function isNoisyLog(args) {
+  const text = args
+    .map((a) => {
+      if (typeof a === 'string') return a;
+      if (a && typeof a === 'object') {
+        try {
+          return a.stack || a.message || JSON.stringify(a);
+        } catch {
+          return String(a);
+        }
+      }
+      return String(a);
+    })
+    .join(' ');
+  return noisyPatterns.some((p) => text.includes(p));
+}
+
+const origLog = console.log.bind(console);
+const origError = console.error.bind(console);
+const origWarn = console.warn.bind(console);
+
+console.log = (...args) => {
+  if (!isNoisyLog(args)) origLog(...args);
+};
+console.error = (...args) => {
+  if (!isNoisyLog(args)) origError(...args);
+};
+console.warn = (...args) => {
+  if (!isNoisyLog(args)) origWarn(...args);
+};
+
+// ==========================================
+// 2. الإعدادات وقاعدة البيانات الدائمة
+// ==========================================
+const PHONE_NUMBER = (process.env.PHONE_NUMBER || '9647703270534').replace(/\D/g, '');
+
 const db = new Database('contacts.db');
 db.exec(`
   CREATE TABLE IF NOT EXISTS contacts (
@@ -35,7 +77,24 @@ const getCountStmt = db.prepare(`SELECT COUNT(*) AS total FROM contacts`);
 const getAllPhonesStmt = db.prepare(`SELECT phone FROM contacts ORDER BY id ASC`);
 const clearAllStmt = db.prepare(`DELETE FROM contacts`);
 
-// 2. توحيد وتنظيف الأرقام لمنع التكرار
+// تتبع معرفات الرسائل التي أرسلها البوت لتجنب الرد على نفسه
+const botSentIds = new Set();
+
+async function sendBotMessage(sock, jid, content, options = {}) {
+  const sent = await sock.sendMessage(jid, content, options);
+  if (sent?.key?.id) {
+    botSentIds.add(sent.key.id);
+    if (botSentIds.size > 500) {
+      const firstKey = botSentIds.values().next().value;
+      botSentIds.delete(firstKey);
+    }
+  }
+  return sent;
+}
+
+// ==========================================
+// 3. دوال معالجة الأرقام والبطاقات والرسائل
+// ==========================================
 function normalizePhone(rawPhone) {
   if (!rawPhone) return null;
   let cleaned = String(rawPhone).replace(/[^\d+]/g, '');
@@ -46,7 +105,6 @@ function normalizePhone(rawPhone) {
   return cleaned.length >= 7 ? cleaned : null;
 }
 
-// 3. استخراج الاسم والرقم من بطاقة vCard واحدة
 function parseSingleVCard(vcardStr) {
   const results = [];
   if (!vcardStr || typeof vcardStr !== 'string') return results;
@@ -66,17 +124,49 @@ function parseSingleVCard(vcardStr) {
   return results;
 }
 
-// 4. استخراج البطاقات سواء كانت بطاقة واحدة أو عدة بطاقات
-function extractContactsFromMessage(msgContent) {
-  const extracted = [];
-  if (!msgContent) return extracted;
+function unwrapMessage(msgContent) {
+  let m = msgContent;
+  while (
+    m?.ephemeralMessage?.message ||
+    m?.viewOnceMessage?.message ||
+    m?.viewOnceMessageV2?.message ||
+    m?.documentWithCaptionMessage?.message
+  ) {
+    m =
+      m.ephemeralMessage?.message ||
+      m.viewOnceMessage?.message ||
+      m.viewOnceMessageV2?.message ||
+      m.documentWithCaptionMessage?.message;
+  }
+  return m;
+}
 
-  if (msgContent.contactMessage?.vcard) {
-    extracted.push(...parseSingleVCard(msgContent.contactMessage.vcard));
+function detectMessageType(m) {
+  if (!m) return 'فارغة / غير معروفة';
+  if (m.contactMessage) return 'بطاقة اتصال (Contact)';
+  if (m.contactsArrayMessage) return 'بطاقات اتصال متعددة (Multi Contact)';
+  if (m.conversation || m.extendedTextMessage) return 'رسالة نصية';
+  if (m.imageMessage) return 'صورة';
+  if (m.videoMessage) return 'فيديو';
+  if (m.audioMessage) return 'رسالة صوتية';
+  if (m.documentMessage) return 'ملف / مستند';
+  if (m.stickerMessage) return 'ملصق';
+  if (m.locationMessage || m.liveLocationMessage) return 'موقع جغرافي';
+  if (m.reactionMessage) return 'تفاعل (Reaction)';
+  if (m.pollCreationMessage) return 'استطلاع';
+  return Object.keys(m)[0] || 'أخرى';
+}
+
+function extractContactsFromMessage(m) {
+  const extracted = [];
+  if (!m) return extracted;
+
+  if (m.contactMessage?.vcard) {
+    extracted.push(...parseSingleVCard(m.contactMessage.vcard));
   }
 
-  if (msgContent.contactsArrayMessage?.contacts?.length) {
-    for (const c of msgContent.contactsArrayMessage.contacts) {
+  if (m.contactsArrayMessage?.contacts?.length) {
+    for (const c of m.contactsArrayMessage.contacts) {
       if (c.vcard) {
         extracted.push(...parseSingleVCard(c.vcard));
       } else if (c.displayName || c.phoneNumber) {
@@ -94,30 +184,61 @@ function extractContactsFromMessage(msgContent) {
   return extracted;
 }
 
-// 5. استخراج نص الرسالة من مختلف أنواع الرسائل
-function getMessageText(msgContent) {
-  if (!msgContent) return '';
+function getMessageText(m) {
+  if (!m) return '';
   return (
-    msgContent.conversation ||
-    msgContent.extendedTextMessage?.text ||
-    msgContent.imageMessage?.caption ||
-    msgContent.videoMessage?.caption ||
+    m.conversation ||
+    m.extendedTextMessage?.text ||
+    m.imageMessage?.caption ||
+    m.videoMessage?.caption ||
+    m.documentMessage?.caption ||
     ''
   ).trim();
 }
 
-// 6. التحقق من أن المرسل مشرف (Admin) داخل المجموعة
-async function isSenderGroupAdmin(sock, groupJid, senderJid) {
+function formatJidDisplay(jid) {
+  if (!jid) return 'غير معروف';
+  return jid.split('@')[0].split(':')[0];
+}
+
+function logIncomingMessage({ chatId, senderId, isGroup, fromMe, typeLabel, preview, statusNote }) {
+  const timeStr = new Date().toLocaleTimeString('ar-IQ', { hour12: false });
+  const place = isGroup ? `مجموعة (${formatJidDisplay(chatId)})` : `خاص (${formatJidDisplay(chatId)})`;
+  const sender = fromMe ? `أنت / البوت (${formatJidDisplay(senderId)})` : formatJidDisplay(senderId);
+
+  const lines = [
+    `────────────────────────────────────────`,
+    `📩 رسالة واردة [${timeStr}]`,
+    `• المكان  : ${place}`,
+    `• المرسل  : ${sender}`,
+    `• النوع   : ${typeLabel}`
+  ];
+  if (preview) lines.push(`• المحتوى : ${preview}`);
+  if (statusNote) lines.push(`• المعالجة: ${statusNote}`);
+  lines.push(`────────────────────────────────────────`);
+
+  origLog(lines.join('\n'));
+}
+
+async function isSenderGroupAdmin(sock, groupJid, senderJid, fromMe) {
+  if (fromMe) return true;
   try {
     const metadata = await sock.groupMetadata(groupJid);
-    const participant = metadata.participants.find((p) => p.id === senderJid);
+    const senderNum = formatJidDisplay(senderJid);
+    const participant = metadata.participants.find((p) => {
+      const pNum = formatJidDisplay(p.id);
+      const pLidNum = p.lid ? formatJidDisplay(p.lid) : '';
+      return p.id === senderJid || p.lid === senderJid || (senderNum && (pNum === senderNum || pLidNum === senderNum));
+    });
     return Boolean(participant && (participant.admin === 'admin' || participant.admin === 'superadmin'));
   } catch {
     return false;
   }
 }
 
-// 7. تشغيل البوت والربط عبر Pairing Code
+// ==========================================
+// 4. تشغيل البوت والربط عبر Pairing Code
+// ==========================================
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
   const { version } = await fetchLatestBaileysVersion();
@@ -130,10 +251,9 @@ async function startBot() {
     browser: ['Ubuntu', 'Chrome', '20.0.04']
   });
 
-  // طلب رمز الاقتران إذا لم يكن الحساب مسجلاً مسبقاً
   if (!sock.authState.creds.registered) {
     if (!PHONE_NUMBER || PHONE_NUMBER.length < 8) {
-      console.error('❌ يرجى تحديد رقم الهاتف بالصيغة الدولية في PHONE_NUMBER (مثال: 9647700000000)');
+      origError('❌ يرجى تحديد رقم الهاتف بالصيغة الدولية في PHONE_NUMBER (مثال: 9647703270534)');
       process.exit(1);
     }
 
@@ -141,10 +261,10 @@ async function startBot() {
       try {
         let code = await sock.requestPairingCode(PHONE_NUMBER);
         code = code?.match(/.{1,4}/g)?.join('-') || code;
-        console.log(`\n🔐 رمز الاقتران (Pairing Code) للرقم ${PHONE_NUMBER}: ${code}\n`);
-        console.log('افتح واتساب > الأجهزة المرتبطة > ربط جهاز > الربط برقم الهاتف وأدخل الرمز.');
+        origLog(`\n🔐 رمز الاقتران للرقم ${PHONE_NUMBER}: ${code}`);
+        origLog('افتح واتساب > الأجهزة المرتبطة > ربط جهاز > الربط برقم الهاتف وأدخل الرمز.\n');
       } catch (err) {
-        console.error('❌ فشل طلب رمز الاقتران:', err);
+        origError('❌ فشل طلب رمز الاقتران:', err?.message || err);
       }
     }, 3000);
   }
@@ -155,17 +275,17 @@ async function startBot() {
     const { connection, lastDisconnect } = update;
 
     if (connection === 'open') {
-      console.log('✅ تم الاتصال بواتساب بنجاح والملفات محفوظة في ./auth_info');
+      origLog('✅ تم الاتصال بواتساب بنجاح وجاهز لاستقبال الرسائل والأوامر.');
     }
 
     if (connection === 'close') {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      console.log(`⚠️ انقطع الاتصال (الرمز: ${statusCode}). إعادة الاتصال: ${shouldReconnect}`);
+      origLog(`⚠️ انقطع الاتصال (الرمز: ${statusCode}) | إعادة الاتصال: ${shouldReconnect ? 'نعم' : 'لا'}`);
       if (shouldReconnect) {
         startBot();
       } else {
-        console.log('🚫 تم تسجيل الخروج من الحساب. احذف مجلد auth_info وأعد الربط.');
+        origLog('🚫 تم تسجيل الخروج من الحساب. احذف مجلد auth_info وأعد الربط.');
       }
     }
   });
@@ -175,16 +295,35 @@ async function startBot() {
 
     for (const msg of messages) {
       try {
-        if (!msg.message || msg.key.fromMe) continue;
+        if (!msg.key?.id) continue;
+        if (botSentIds.has(msg.key.id)) continue;
 
         const chatId = msg.key.remoteJid;
         if (!chatId || chatId === 'status@broadcast') continue;
 
-        const isGroup = chatId.endsWith('@g.us');
-        const senderId = isGroup ? msg.key.participant : chatId;
-        const body = getMessageText(msg.message);
+        const m = unwrapMessage(msg.message);
+        if (!m) continue;
 
-        // --- الأوامر النصية ---
+        const isGroup = chatId.endsWith('@g.us');
+        const fromMe = Boolean(msg.key.fromMe);
+        const senderId = fromMe
+          ? sock.user?.id || `${PHONE_NUMBER}@s.whatsapp.net`
+          : isGroup
+            ? msg.key.participant || chatId
+            : chatId;
+
+        const typeLabel = detectMessageType(m);
+        const body = getMessageText(m);
+        const extractedContacts = extractContactsFromMessage(m);
+
+        let preview = '';
+        if (body) {
+          preview = body.length > 90 ? `${body.slice(0, 90)}...` : body;
+        } else if (extractedContacts.length > 0) {
+          preview = extractedContacts.map((c) => `${c.name} (${c.phone})`).join(' ، ');
+        }
+
+        // --- 1. الأوامر (تعمل من أي رقم ومن رقم البوت نفسه أيضاً) ---
         if (body === '$مساعدة') {
           const helpText = [
             '📋 *قائمة أوامر البوت:*',
@@ -196,28 +335,49 @@ async function startBot() {
             '💡 لإضافة رقم، أرسل بطاقة جهة اتصال (Contact / vCard) داخل المجموعة.'
           ].join('\n');
 
-          await sock.sendMessage(chatId, { text: helpText }, { quoted: msg });
+          await sendBotMessage(sock, chatId, { text: helpText }, { quoted: msg });
+          logIncomingMessage({ chatId, senderId, isGroup, fromMe, typeLabel, preview, statusNote: 'نُفّذ أمر $مساعدة' });
           continue;
         }
 
         if (body === '$احسب') {
           const { total } = getCountStmt.get();
-          await sock.sendMessage(
+          await sendBotMessage(
+            sock,
             chatId,
             { text: `📊 العدد الكلي للأرقام المسجلة: *${total}*` },
             { quoted: msg }
           );
+          logIncomingMessage({
+            chatId,
+            senderId,
+            isGroup,
+            fromMe,
+            typeLabel,
+            preview,
+            statusNote: `نُفّذ أمر $احسب (المجموع: ${total})`
+          });
           continue;
         }
 
         if (body === '$ناتج') {
           const rows = getAllPhonesStmt.all();
           if (rows.length === 0) {
-            await sock.sendMessage(
+            await sendBotMessage(
+              sock,
               chatId,
               { text: '⚠️ لا توجد أرقام محفوظة حالياً لتصديرها.' },
               { quoted: msg }
             );
+            logIncomingMessage({
+              chatId,
+              senderId,
+              isGroup,
+              fromMe,
+              typeLabel,
+              preview,
+              statusNote: 'نُفّذ أمر $ناتج (لا توجد أرقام)'
+            });
             continue;
           }
 
@@ -225,7 +385,8 @@ async function startBot() {
           const tempPath = path.join(__dirname, 'numbers_export.txt');
           fs.writeFileSync(tempPath, content, 'utf8');
 
-          await sock.sendMessage(
+          await sendBotMessage(
+            sock,
             chatId,
             {
               document: fs.readFileSync(tempPath),
@@ -237,68 +398,130 @@ async function startBot() {
           );
 
           fs.unlinkSync(tempPath);
+          logIncomingMessage({
+            chatId,
+            senderId,
+            isGroup,
+            fromMe,
+            typeLabel,
+            preview,
+            statusNote: `نُفّذ أمر $ناتج (تم إرسال ${rows.length} رقم)`
+          });
           continue;
         }
 
         if (body === '$مسح') {
           if (!isGroup) {
-            await sock.sendMessage(
+            await sendBotMessage(
+              sock,
               chatId,
               { text: '⚠️ هذا الأمر مخصص للمجموعات فقط.' },
               { quoted: msg }
             );
+            logIncomingMessage({
+              chatId,
+              senderId,
+              isGroup,
+              fromMe,
+              typeLabel,
+              preview,
+              statusNote: 'رُفض أمر $مسح (خارج مجموعة)'
+            });
             continue;
           }
 
-          const admin = await isSenderGroupAdmin(sock, chatId, senderId);
+          const admin = await isSenderGroupAdmin(sock, chatId, senderId, fromMe);
           if (!admin) {
-            await sock.sendMessage(
+            await sendBotMessage(
+              sock,
               chatId,
               { text: '🚫 عذراً، أمر *$مسح* متاح لإدارة المجموعة فقط.' },
               { quoted: msg }
             );
+            logIncomingMessage({
+              chatId,
+              senderId,
+              isGroup,
+              fromMe,
+              typeLabel,
+              preview,
+              statusNote: 'رُفض أمر $مسح (المرسل ليس مشرفاً)'
+            });
             continue;
           }
 
           const info = clearAllStmt.run();
-          await sock.sendMessage(
+          await sendBotMessage(
+            sock,
             chatId,
             { text: `🗑️ تم حذف جميع الأرقام المسجلة (تم حذف *${info.changes}* رقم).` },
             { quoted: msg }
           );
+          logIncomingMessage({
+            chatId,
+            senderId,
+            isGroup,
+            fromMe,
+            typeLabel,
+            preview,
+            statusNote: `نُفّذ أمر $مسح (حُذف ${info.changes} رقم)`
+          });
           continue;
         }
 
-        // --- استقبال بطاقات الاتصال (Contact / vCard) ---
-        if (isGroup) {
-          const extracted = extractContactsFromMessage(msg.message);
-          if (extracted.length > 0) {
-            const statusLines = [];
+        // --- 2. استقبال بطاقات الاتصال داخل المجموعات ---
+        if (isGroup && extractedContacts.length > 0) {
+          const statusLines = [];
+          let addedCount = 0;
+          let dupCount = 0;
 
-            for (const item of extracted) {
-              const exists = getContactByPhoneStmt.get(item.phone);
-              if (exists) {
-                statusLines.push(`ℹ️ الرقم *${item.phone}* (${item.name}) مسجل مسبقاً.`);
+          for (const item of extractedContacts) {
+            const exists = getContactByPhoneStmt.get(item.phone);
+            if (exists) {
+              dupCount++;
+              statusLines.push(`ℹ️ الرقم *${item.phone}* (${item.name}) مسجل مسبقاً.`);
+            } else {
+              const res = insertContactStmt.run({
+                phone: item.phone,
+                name: item.name,
+                added_by: senderId,
+                group_id: chatId
+              });
+              if (res.changes > 0) {
+                addedCount++;
+                statusLines.push(`✅ تم حفظ الرقم *${item.phone}* باسم: *${item.name}*`);
               } else {
-                const res = insertContactStmt.run({
-                  phone: item.phone,
-                  name: item.name,
-                  added_by: senderId,
-                  group_id: chatId
-                });
-                if (res.changes > 0) {
-                  statusLines.push(`✅ تم حفظ الرقم *${item.phone}* باسم: *${item.name}*`);
-                } else {
-                  statusLines.push(`ℹ️ الرقم *${item.phone}* (${item.name}) مسجل مسبقاً.`);
-                }
+                dupCount++;
+                statusLines.push(`ℹ️ الرقم *${item.phone}* (${item.name}) مسجل مسبقاً.`);
               }
             }
-
-            await sock.sendMessage(chatId, { text: statusLines.join('\n') }, { quoted: msg });
           }
+
+          await sendBotMessage(sock, chatId, { text: statusLines.join('\n') }, { quoted: msg });
+          logIncomingMessage({
+            chatId,
+            senderId,
+            isGroup,
+            fromMe,
+            typeLabel,
+            preview,
+            statusNote: `بطاقة اتصال (مضاف: ${addedCount} ، مكرر: ${dupCount})`
+          });
+          continue;
         }
+
+        // --- 3. تسجيل أي رسالة أخرى تصل بشكل مرتب في اللوق ---
+        logIncomingMessage({
+          chatId,
+          senderId,
+          isGroup,
+          fromMe,
+          typeLabel,
+          preview,
+          statusNote: 'تمت القراءة والتعرف على الرسالة'
+        });
       } catch (err) {
-        console.error('❌ خطأ أثناء معالجة الرسالة:', err);
+        origError('❌ خطأ أثناء معالجة الرسالة:', err?.message || err);
       }
     }
   });
