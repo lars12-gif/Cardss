@@ -313,7 +313,7 @@ async function start() {
     if (connection === 'connecting') {
       log('🔄 جارٍ الاتصال بواتساب...');
       // Do not request the pairing code immediately: the websocket handshake needs time.
-      schedulePairingCode(currentSocket, authState);
+      schedulePairingCode(currentSocket, state);
     }
 
     if (connection === 'open') {
