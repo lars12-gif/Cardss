@@ -1,0 +1,20 @@
+{
+  "name": "wa-vcard-manager",
+  "version": "2.0.0",
+  "private": true,
+  "description": "WhatsApp vCard collector and number exporter powered by Baileys",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "check": "node --check src/index.js && node --check src/store.js && node --check src/vcard.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "6.7.24",
+    "dotenv": "16.6.1",
+    "pino": "9.6.0"
+  }
+}
