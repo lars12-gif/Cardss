@@ -1,8 +1,8 @@
 {
   "name": "wa-vcard-manager",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
-  "description": "WhatsApp vCard collector and number exporter powered by Baileys",
+  "description": "WhatsApp vCard collector with serialized storage writes and Baileys session diagnostics",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
