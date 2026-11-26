@@ -1,20 +1,18 @@
 {
-  "name": "wa-vcard-manager",
-  "version": "2.1.0",
-  "private": true,
-  "description": "WhatsApp vCard collector with serialized storage writes and Baileys session diagnostics",
-  "type": "module",
-  "main": "src/index.js",
+  "name": "whatsapp-vcard-bot",
+  "version": "1.0.0",
+  "description": "WhatsApp vCard contact collector bot using Baileys pairing code and SQLite",
+  "main": "index.js",
+  "type": "commonjs",
   "scripts": {
-    "start": "node src/index.js",
-    "check": "node --check src/index.js && node --check src/store.js && node --check src/vcard.js"
-  },
-  "engines": {
-    "node": ">=20.0.0"
+    "start": "node index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "6.7.24",
-    "dotenv": "16.6.1",
-    "pino": "9.6.0"
+    "@whiskeysockets/baileys": "^6.7.0",
+    "better-sqlite3": "^11.0.0",
+    "pino": "^9.0.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
