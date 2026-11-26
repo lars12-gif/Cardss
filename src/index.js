@@ -88,6 +88,9 @@ function unwrapMessage(message) {
     else if (m.viewOnceMessage?.message) m = m.viewOnceMessage.message;
     else if (m.viewOnceMessageV2?.message) m = m.viewOnceMessageV2.message;
     else if (m.documentWithCaptionMessage?.message) m = m.documentWithCaptionMessage.message;
+    else if (m.deviceSentMessage?.message) m = m.deviceSentMessage.message;
+    else if (m.editedMessage?.message) m = m.editedMessage.message;
+    else if (m.keepInChatMessage?.message) m = m.keepInChatMessage.message;
     else break;
   }
   return m || {};
@@ -102,10 +105,20 @@ function getText(message) {
 function extractVCards(message) {
   const m = unwrapMessage(message.message);
   const cards = [];
-  if (m.contactMessage?.vcard) cards.push(m.contactMessage.vcard);
-  if (Array.isArray(m.contactsArrayMessage?.contacts)) {
-    for (const c of m.contactsArrayMessage.contacts) if (c?.vcard) cards.push(c.vcard);
+
+  if (typeof m.contactMessage?.vcard === 'string' && m.contactMessage.vcard.trim()) {
+    cards.push(m.contactMessage.vcard);
   }
+
+  const contacts = m.contactsArrayMessage?.contacts;
+  if (Array.isArray(contacts)) {
+    for (const contact of contacts) {
+      if (typeof contact?.vcard === 'string' && contact.vcard.trim()) {
+        cards.push(contact.vcard);
+      }
+    }
+  }
+
   return cards;
 }
 
@@ -209,7 +222,17 @@ async function handleMessage(message) {
     return;
   }
 
+  const unwrapped = unwrapMessage(message.message);
   const vcards = extractVCards(message);
+  if (state.active && !vcards.length &&
+      (unwrapped.contactMessage || unwrapped.contactsArrayMessage)) {
+    const contactCount = Array.isArray(unwrapped.contactsArrayMessage?.contacts)
+      ? unwrapped.contactsArrayMessage.contacts.length : 0;
+    log(`⚠️ وصلت رسالة جهة اتصال لكن بدون vCard قابل للقراءة (نوع: ${
+      unwrapped.contactMessage ? 'contactMessage' : 'contactsArrayMessage'
+    } | عدد العناصر: ${contactCount})`);
+  }
+
   if (vcards.length && state.active) {
     for (const vcard of vcards) {
       const result = recordVCard(chatId, vcard);
@@ -248,7 +271,7 @@ function schedulePairingCode(currentSocket, authState) {
         log('⏳ سأعيد المحاولة بعد 4 ثوانٍ...');
         pairingTimer = setTimeout(() => {
           pairingTimer = null;
-          schedulePairingCode(currentSocket, state);
+          schedulePairingCode(currentSocket, authState);
         }, 4000);
       } else {
         log('❌ لم أتمكن من إصدار الرمز. تحقق من رقم الهاتف وإصدار Baileys ثم أعد التشغيل.');
@@ -290,7 +313,7 @@ async function start() {
     if (connection === 'connecting') {
       log('🔄 جارٍ الاتصال بواتساب...');
       // Do not request the pairing code immediately: the websocket handshake needs time.
-      schedulePairingCode(currentSocket, state);
+      schedulePairingCode(currentSocket, authState);
     }
 
     if (connection === 'open') {
