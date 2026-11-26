@@ -66,7 +66,12 @@ db.exec(`
     added_by TEXT,
     group_id TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )
+  );
+
+  CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
 `);
 
 const insertContactStmt = db.prepare(`
@@ -77,6 +82,21 @@ const getContactByPhoneStmt = db.prepare(`SELECT * FROM contacts WHERE phone = ?
 const getCountStmt = db.prepare(`SELECT COUNT(*) AS total FROM contacts`);
 const getAllPhonesStmt = db.prepare(`SELECT phone FROM contacts ORDER BY id ASC`);
 const clearAllStmt = db.prepare(`DELETE FROM contacts`);
+
+const setSettingStmt = db.prepare(`
+  INSERT INTO settings (key, value) VALUES (@key, @value)
+  ON CONFLICT(key) DO UPDATE SET value = excluded.value
+`);
+const getSettingStmt = db.prepare(`SELECT value FROM settings WHERE key = ?`);
+
+function getActiveGroupId() {
+  const row = getSettingStmt.get('active_group_id');
+  return row ? row.value : null;
+}
+
+function setActiveGroupId(groupJid) {
+  setSettingStmt.run({ key: 'active_group_id', value: groupJid });
+}
 
 const botSentIds = new Set();
 
@@ -109,7 +129,7 @@ function normalizeArabicCommand(text) {
   if (!text) return '';
   return text
     .trim()
-    .replace(/[\u064B-\u065F\u0670]/g, '') // إزالة التشكيل
+    .replace(/[\u064B-\u065F\u0670]/g, '')
     .replace(/[إأآا]/g, 'ا')
     .replace(/ى/g, 'ي')
     .replace(/ة/g, 'ه')
@@ -307,7 +327,13 @@ async function startBot() {
 
     if (connection === 'open') {
       const userId = sock.user?.id ? jidNormalizedUser(sock.user.id) : PHONE_NUMBER;
-      origLog(`✅ تم الاتصال بواتساب بنجاح (${cleanId(userId)}) — بانتظار الرسائل والأوامر.`);
+      const activeGrp = getActiveGroupId();
+      origLog(`✅ تم الاتصال بواتساب بنجاح (${cleanId(userId)})`);
+      origLog(
+        activeGrp
+          ? `🎯 المجموعة المفعّلة حالياً: ${cleanId(activeGrp)}`
+          : `ℹ️ لم يتم تحديد مجموعة بعد. أرسل $تنصيب داخل المجموعة المطلوبة.`
+      );
     }
 
     if (connection === 'close') {
@@ -355,16 +381,100 @@ async function startBot() {
           preview = extractedContacts.map((c) => `${c.name} (${c.phone})`).join(' ، ');
         }
 
-        // --- 1. الأوامر ---
+        // --- أمر $تنصيب لتحديد المجموعة المفعّلة ---
+        if (cmd === '$تنصيب') {
+          if (!isGroup) {
+            await sendBotMessage(
+              sock,
+              chatId,
+              { text: '⚠️ أمر *$تنصيب* يجب إرساله داخل المجموعة التي تريد تفعيل البوت فيها.' },
+              { quoted: msg }
+            );
+            logIncomingMessage({
+              chatId,
+              senderId,
+              isGroup,
+              fromMe,
+              typeLabel,
+              preview,
+              statusNote: 'رُفض أمر $تنصيب (خارج مجموعة)'
+            });
+            continue;
+          }
+
+          const admin = await isSenderGroupAdmin(sock, chatId, senderId, altJid, fromMe);
+          if (!admin) {
+            await sendBotMessage(
+              sock,
+              chatId,
+              { text: '🚫 عذراً، أمر *$تنصيب* متاح لإدارة المجموعة فقط.' },
+              { quoted: msg }
+            );
+            logIncomingMessage({
+              chatId,
+              senderId,
+              isGroup,
+              fromMe,
+              typeLabel,
+              preview,
+              statusNote: 'رُفض أمر $تنصيب (المرسل ليس مشرفاً)'
+            });
+            continue;
+          }
+
+          setActiveGroupId(chatId);
+          let groupSubject = cleanId(chatId);
+          try {
+            const meta = await sock.groupMetadata(chatId);
+            if (meta?.subject) groupSubject = meta.subject;
+          } catch {}
+
+          await sendBotMessage(
+            sock,
+            chatId,
+            {
+              text: `✅ تم تنصيب البوت وتفعيله في هذه المجموعة (*${groupSubject}*).\nلن يستجيب البوت في أي مجموعة أخرى.`
+            },
+            { quoted: msg }
+          );
+          logIncomingMessage({
+            chatId,
+            senderId,
+            isGroup,
+            fromMe,
+            typeLabel,
+            preview,
+            statusNote: `تم تعيين المجموعة المفعّلة: ${groupSubject}`
+          });
+          continue;
+        }
+
+        // --- التحقق من أن الرسالة داخل المجموعة المفعّلة إذا كان هناك مجموعة محددة ---
+        const activeGroupId = getActiveGroupId();
+        if (isGroup && activeGroupId && chatId !== activeGroupId) {
+          logIncomingMessage({
+            chatId,
+            senderId,
+            isGroup,
+            fromMe,
+            typeLabel,
+            preview,
+            statusNote: 'متجاهل (المجموعة غير مفعّلة)'
+          });
+          continue;
+        }
+
+        // --- بقية الأوامر ---
         if (cmd === '$مساعده') {
           const helpText = [
             '📋 *قائمة أوامر البوت:*',
+            '• *$تنصيب* : تحديد المجموعة الحالية لتشغيل البوت فيها فقط.',
             '• *$احسب* : عرض العدد الكلي للأرقام المسجلة.',
             '• *$ناتج* : تصدير جميع الأرقام المحفوظة بملف TXT (كل رقم بسطر).',
             '• *$مسح* : حذف الأرقام المسجلة (للإدارة فقط).',
             '• *$مساعدة* : عرض قائمة الأوامر ووظائفها.',
             '',
-            '💡 لإضافة رقم، أرسل بطاقة جهة اتصال (Contact / vCard) داخل المجموعة.'
+            '💡 لإضافة رقم، أرسل بطاقة جهة اتصال (Contact / vCard) داخل المجموعة المفعّلة.'
           ].join('\n');
 
           await sendBotMessage(sock, chatId, { text: helpText }, { quoted: msg });
@@ -509,7 +619,7 @@ async function startBot() {
           continue;
         }
 
-        // --- 2. استقبال بطاقات الاتصال داخل المجموعات ---
+        // --- استقبال بطاقات الاتصال داخل المجموعة المفعّلة ---
         if (isGroup && extractedContacts.length > 0) {
           const statusLines = [];
           let addedCount = 0;
@@ -550,7 +660,7 @@ async function startBot() {
           continue;
         }
 
-        // --- 3. تسجيل كل رسالة تصل بشكل مرتب في اللوق ---
+        // --- تسجيل كل رسالة تصل بشكل مرتب في اللوق ---
         logIncomingMessage({
           chatId,
           senderId,
