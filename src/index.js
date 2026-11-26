@@ -8,7 +8,6 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
-  jidNormalizedUser,
   Browsers
 } = require('@whiskeysockets/baileys');
 
@@ -18,25 +17,33 @@ const GROUPS_ONLY = String(process.env.GROUPS_ONLY || 'false').toLowerCase() ===
 const OWNER_NUMBER = digits(process.env.OWNER_NUMBER || '');
 const DATA_FILE = path.resolve(process.env.DATA_FILE || './data/collections.json');
 const AUTH_DIR = path.resolve('./auth_info');
-const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 
+// Silence Baileys' verbose JSON logger. We print short, readable messages ourselves.
+const logger = pino({ level: 'silent' });
 let store = loadStore();
-let sock;
-let reconnecting = false;
+let sock = null;
+let reconnectTimer = null;
+let pairingTimer = null;
+let pairingAttempts = 0;
+let shuttingDown = false;
 
 function digits(value) {
   return String(value || '').replace(/\D/g, '');
 }
 
+function log(message) {
+  const time = new Date().toLocaleTimeString('en-GB', { hour12: false, timeZone: process.env.TZ || 'Asia/Baghdad' });
+  console.log(`[${time}] ${message}`);
+}
+
 function loadStore() {
   try {
     if (!fs.existsSync(DATA_FILE)) return { chats: {} };
-    const parsed = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    if (!parsed || typeof parsed !== 'object') return { chats: {} };
-    if (!parsed.chats || typeof parsed.chats !== 'object') parsed.chats = {};
-    return parsed;
-  } catch (error) {
-    logger.error({ err: error }, 'Could not read data file; starting with an empty store');
+    const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    if (!data.chats || typeof data.chats !== 'object') data.chats = {};
+    return data;
+  } catch {
+    log('⚠️ تعذر قراءة ملف البيانات، سيتم إنشاء ملف جديد.');
     return { chats: {} };
   }
 }
@@ -51,20 +58,13 @@ function saveStore() {
 function getChatState(chatId) {
   if (!store.chats[chatId]) {
     store.chats[chatId] = {
-      active: false,
-      startedAt: null,
-      received: 0,
-      success: 0,
-      failed: 0,
-      duplicates: 0,
-      numbers: [],
-      numberSet: []
+      active: false, startedAt: null, received: 0,
+      success: 0, failed: 0, duplicates: 0, numbers: [], numberSet: []
     };
   }
-  const state = store.chats[chatId];
-  if (!Array.isArray(state.numbers)) state.numbers = [];
-  if (!Array.isArray(state.numberSet)) state.numberSet = [...state.numbers];
-  return state;
+  const s = store.chats[chatId];
+  for (const key of ['numbers', 'numberSet']) if (!Array.isArray(s[key])) s[key] = [];
+  return s;
 }
 
 function isGroup(jid) {
@@ -78,115 +78,83 @@ function senderNumber(message, chatId) {
 
 function isAuthorized(message, chatId) {
   if (GROUPS_ONLY && !isGroup(chatId)) return false;
-  if (!OWNER_NUMBER) return true;
-  return senderNumber(message, chatId) === OWNER_NUMBER;
+  return !OWNER_NUMBER || senderNumber(message, chatId) === OWNER_NUMBER;
 }
 
 function unwrapMessage(message) {
-  let content = message;
-  for (let i = 0; i < 6; i++) {
-    if (!content) break;
-    if (content.ephemeralMessage?.message) content = content.ephemeralMessage.message;
-    else if (content.viewOnceMessage?.message) content = content.viewOnceMessage.message;
-    else if (content.viewOnceMessageV2?.message) content = content.viewOnceMessageV2.message;
-    else if (content.documentWithCaptionMessage?.message) content = content.documentWithCaptionMessage.message;
+  let m = message;
+  for (let i = 0; i < 6 && m; i++) {
+    if (m.ephemeralMessage?.message) m = m.ephemeralMessage.message;
+    else if (m.viewOnceMessage?.message) m = m.viewOnceMessage.message;
+    else if (m.viewOnceMessageV2?.message) m = m.viewOnceMessageV2.message;
+    else if (m.documentWithCaptionMessage?.message) m = m.documentWithCaptionMessage.message;
     else break;
   }
-  return content || {};
+  return m || {};
 }
 
 function getText(message) {
   const m = unwrapMessage(message.message);
-  return (
-    m.conversation ||
-    m.extendedTextMessage?.text ||
-    m.imageMessage?.caption ||
-    m.videoMessage?.caption ||
-    ''
-  ).trim();
+  return (m.conversation || m.extendedTextMessage?.text ||
+    m.imageMessage?.caption || m.videoMessage?.caption || '').trim();
 }
 
 function extractVCards(message) {
   const m = unwrapMessage(message.message);
   const cards = [];
-
-  if (m.contactMessage?.vcard) {
-    cards.push(m.contactMessage.vcard);
+  if (m.contactMessage?.vcard) cards.push(m.contactMessage.vcard);
+  if (Array.isArray(m.contactsArrayMessage?.contacts)) {
+    for (const c of m.contactsArrayMessage.contacts) if (c?.vcard) cards.push(c.vcard);
   }
-
-  const array = m.contactsArrayMessage?.contacts;
-  if (Array.isArray(array)) {
-    for (const item of array) {
-      if (item?.vcard) cards.push(item.vcard);
-    }
-  }
-
   return cards;
 }
 
 function parseTelValues(vcard) {
-  const found = [];
-  // vCard TEL lines can be folded onto the next line. Unfold before parsing.
   const unfolded = String(vcard || '').replace(/\r?\n[ \t]/g, '');
-  for (const line of unfolded.split(/\r?\n/)) {
-    if (!/^TEL(?:;[^:]*)?:/i.test(line.trim())) continue;
-    const value = line.slice(line.indexOf(':') + 1).trim();
-    if (value) found.push(value);
-  }
-  return found;
+  return unfolded.split(/\r?\n/)
+    .filter(line => /^TEL(?:;[^:]*)?:/i.test(line.trim()))
+    .map(line => line.slice(line.indexOf(':') + 1).trim())
+    .filter(Boolean);
 }
 
 function normalizePhone(raw) {
   let value = String(raw || '').trim();
   if (!value) return null;
-
-  // Strip common vCard URI prefixes and extension fragments.
   value = value.replace(/^tel:/i, '').split(';')[0].split(',')[0].trim();
   value = value.replace(/(?:ext\.?|x)\s*\d+$/i, '');
-  const hadPlus = value.startsWith('+') || value.startsWith('00');
+  const international = value.startsWith('+') || value.startsWith('00');
   let number = digits(value);
-
   if (!number) return null;
   if (number.startsWith('00')) number = number.slice(2);
 
-  if (!hadPlus && DEFAULT_COUNTRY_CODE) {
-    // Convert a national Iraqi-style trunk prefix 0 to the configured country code.
+  if (!international && DEFAULT_COUNTRY_CODE) {
     if (number.startsWith('0')) number = DEFAULT_COUNTRY_CODE + number.slice(1);
-    // Otherwise, treat an unprefixed local number as national and prepend the default code.
     else if (!number.startsWith(DEFAULT_COUNTRY_CODE)) number = DEFAULT_COUNTRY_CODE + number;
   }
-
-  // Basic sanity check; full carrier/number allocation validation is not possible offline.
   if (number.length < 7 || number.length > 15) return null;
   return '+' + number;
 }
 
 function recordVCard(chatId, vcard) {
-  const state = getChatState(chatId);
-  state.received += 1;
-  const telValues = parseTelValues(vcard);
-  const candidates = telValues.map(normalizePhone).filter(Boolean);
-
-  if (candidates.length === 0) {
-    state.failed += 1;
+  const s = getChatState(chatId);
+  s.received++;
+  const numbers = parseTelValues(vcard).map(normalizePhone).filter(Boolean);
+  if (!numbers.length) {
+    s.failed++;
     return 'failed';
   }
-
-  // One vCard may contain more than one TEL. Count each unique number independently.
-  let addedAny = false;
-  for (const number of candidates) {
-    if (state.numberSet.includes(number)) {
-      state.duplicates += 1;
+  let added = 0;
+  for (const number of numbers) {
+    if (s.numberSet.includes(number)) {
+      s.duplicates++;
       continue;
     }
-    state.numberSet.push(number);
-    state.numbers.push(number);
-    state.success += 1;
-    addedAny = true;
+    s.numberSet.push(number);
+    s.numbers.push(number);
+    s.success++;
+    added++;
   }
-
-  if (!addedAny) return 'duplicate';
-  return 'success';
+  return added ? 'success' : 'duplicate';
 }
 
 async function sendText(chatId, text) {
@@ -196,8 +164,7 @@ async function sendText(chatId, text) {
 async function handleMessage(message) {
   if (!message.message || message.key.fromMe) return;
   const chatId = message.key.remoteJid;
-  if (!chatId || chatId === 'status@broadcast') return;
-  if (!isAuthorized(message, chatId)) return;
+  if (!chatId || chatId === 'status@broadcast' || !isAuthorized(message, chatId)) return;
 
   const text = getText(message);
   const state = getChatState(chatId);
@@ -205,17 +172,15 @@ async function handleMessage(message) {
   if (text === '$احسب') {
     state.active = true;
     state.startedAt = new Date().toISOString();
-    state.received = 0;
-    state.success = 0;
-    state.failed = 0;
-    state.duplicates = 0;
+    state.received = state.success = state.failed = state.duplicates = 0;
     state.numbers = [];
     state.numberSet = [];
     saveStore();
+    log(`🟢 بدأت عملية جمع جديدة في ${chatId}`);
     await sendText(chatId,
-      '✅ تم تفعيل نظام جمع الأرقام.\\n' +
-      '📥 أرسل جهات الاتصال بصيغة vCard.\\n' +
-      '📊 العدد الحالي: 0\\n\\n' +
+      '✅ تم تفعيل نظام جمع الأرقام.\n' +
+      '📥 أرسل جهات الاتصال بصيغة vCard.\n' +
+      '📊 العدد الحالي: 0\n\n' +
       'عند الانتهاء أرسل: $ناتج'
     );
     return;
@@ -226,34 +191,70 @@ async function handleMessage(message) {
       await sendText(chatId, '⚠️ لا توجد عملية جمع حالية. أرسل $احسب أولاً.');
       return;
     }
-
     state.active = false;
     saveStore();
 
-    // Send the complete number list as its own message, followed by a separate summary.
-    const numbersText = state.numbers.length ? state.numbers.join('\n') : 'لا توجد أرقام صالحة.';
-    await sendText(chatId, numbersText);
-
+    // Keep the number dump and summary as two distinct WhatsApp messages.
+    await sendText(chatId, state.numbers.length ? state.numbers.join('\n') : 'لا توجد أرقام صالحة.');
     const summary =
-      '📊 ملخص عملية الحساب\\n\\n' +
-      '📥 إجمالي الجهات المستلمة: ' + state.received + '\\n' +
-      '✅ الأرقام الناجحة: ' + state.success + '\\n' +
-      '❌ الجهات الفاشلة: ' + state.failed + '\\n' +
-      '🔄 الأرقام المكررة: ' + state.duplicates + '\\n' +
-      '📱 إجمالي الأرقام الفريدة: ' + state.numbers.length + '\\n\\n' +
+      '📊 ملخص عملية الحساب\n\n' +
+      `📥 إجمالي الجهات المستلمة: ${state.received}\n` +
+      `✅ الأرقام الناجحة: ${state.success}\n` +
+      `❌ الجهات الفاشلة: ${state.failed}\n` +
+      `🔁 الأرقام المكررة: ${state.duplicates}\n` +
+      `📱 الأرقام الفريدة: ${state.numbers.length}\n\n` +
       'تم الانتهاء من استخراج الأرقام.';
     await sendText(chatId, summary);
+    log(`📦 اكتمل الجمع: ${state.numbers.length} رقم فريد | ${state.failed} فشل | ${state.duplicates} تكرار`);
     return;
   }
 
   const vcards = extractVCards(message);
   if (vcards.length && state.active) {
-    for (const vcard of vcards) recordVCard(chatId, vcard);
+    for (const vcard of vcards) {
+      const result = recordVCard(chatId, vcard);
+      if (result === 'success') log(`✅ تم استلام جهة اتصال وحفظ رقم (المجموع: ${state.numbers.length})`);
+      else if (result === 'duplicate') log(`🔁 جهة اتصال مكررة (المجموع: ${state.numbers.length})`);
+      else log(`❌ جهة اتصال بدون رقم صالح (الفشل: ${state.failed})`);
+    }
     saveStore();
-    return;
   }
+}
 
-  // vCards sent before $احسب are deliberately ignored.
+function schedulePairingCode(currentSocket, authState) {
+  if (authState.creds.registered || pairingTimer || shuttingDown) return;
+  pairingTimer = setTimeout(async () => {
+    pairingTimer = null;
+    if (sock !== currentSocket || authState.creds.registered || shuttingDown) return;
+
+    if (!BOT_NUMBER || BOT_NUMBER.includes('X')) {
+      log('❌ ضع رقم واتساب في BOT_NUMBER داخل إعدادات البيئة أولاً.');
+      return;
+    }
+
+    try {
+      pairingAttempts++;
+      log(`🔐 جارٍ طلب رمز الاقتران للحساب +${BOT_NUMBER} (محاولة ${pairingAttempts})...`);
+      const code = await currentSocket.requestPairingCode(BOT_NUMBER);
+      log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      log(`📲 رقم الحساب: +${BOT_NUMBER}`);
+      log(`🔑 رمز الاقتران: ${code}`);
+      log('افتح واتساب ← الأجهزة المرتبطة ← ربط جهاز ← الربط برقم الهاتف');
+      log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    } catch (error) {
+      const status = error?.output?.statusCode || error?.statusCode;
+      log(`⚠️ تعذر إصدار رمز الاقتران${status ? ` (HTTP ${status})` : ''}: ${error?.message || 'خطأ غير معروف'}`);
+      if (pairingAttempts < 5 && sock === currentSocket && !shuttingDown) {
+        log('⏳ سأعيد المحاولة بعد 4 ثوانٍ...');
+        pairingTimer = setTimeout(() => {
+          pairingTimer = null;
+          schedulePairingCode(currentSocket, state);
+        }, 4000);
+      } else {
+        log('❌ لم أتمكن من إصدار الرمز. تحقق من رقم الهاتف وإصدار Baileys ثم أعد التشغيل.');
+      }
+    }
+  }, 5000);
 }
 
 async function start() {
@@ -265,12 +266,12 @@ async function start() {
   try {
     const latest = await fetchLatestBaileysVersion();
     version = latest.version;
-    logger.info({ version }, 'Using latest WhatsApp Web version');
-  } catch (error) {
-    logger.warn({ err: error }, 'Could not fetch latest version; using library default');
+    log(`📡 إصدار WhatsApp Web: ${version.join('.')}`);
+  } catch {
+    log('⚠️ تعذر جلب إصدار WhatsApp Web، سيتم استخدام الإصدار الافتراضي.');
   }
 
-  sock = makeWASocket({
+  const currentSocket = makeWASocket({
     version,
     auth: state,
     logger,
@@ -279,65 +280,77 @@ async function start() {
     markOnlineOnConnect: false,
     syncFullHistory: false
   });
+  sock = currentSocket;
+  pairingAttempts = 0;
+  currentSocket.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('creds.update', saveCreds);
-
-  sock.ev.on('connection.update', async (update) => {
+  currentSocket.ev.on('connection.update', update => {
     const { connection, lastDisconnect } = update;
 
-    if (connection === 'connecting' && !sock.authState.creds.registered) {
-      if (!BOT_NUMBER || BOT_NUMBER.includes('X')) {
-        logger.error('Set BOT_NUMBER in .env before starting the bot.');
-      } else {
-        try {
-          const code = await sock.requestPairingCode(BOT_NUMBER);
-          console.log('\\n========================================');
-          console.log('WhatsApp Pairing Code: ' + code);
-          console.log('Open WhatsApp > Linked devices > Link with phone number');
-          console.log('========================================\\n');
-        } catch (error) {
-          logger.error({ err: error }, 'Could not generate pairing code');
-        }
-      }
+    if (connection === 'connecting') {
+      log('🔄 جارٍ الاتصال بواتساب...');
+      // Do not request the pairing code immediately: the websocket handshake needs time.
+      schedulePairingCode(currentSocket, state);
     }
 
     if (connection === 'open') {
-      logger.info('WhatsApp bot connected successfully');
-      reconnecting = false;
+      if (pairingTimer) clearTimeout(pairingTimer);
+      pairingTimer = null;
+      log('✅ تم الاتصال بواتساب بنجاح. البوت يعمل الآن.');
     }
 
     if (connection === 'close') {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const loggedOut = statusCode === DisconnectReason.loggedOut;
-      logger.warn({ statusCode, loggedOut }, 'WhatsApp connection closed');
-      if (!loggedOut && !reconnecting) {
-        reconnecting = true;
-        setTimeout(() => start().catch(err => logger.error({ err }, 'Reconnect failed')), 3000);
-      } else if (loggedOut) {
-        logger.error('Session logged out. Remove auth_info and pair again.');
+      if (pairingTimer) clearTimeout(pairingTimer);
+      pairingTimer = null;
+      const status = lastDisconnect?.error?.output?.statusCode;
+      const registered = state.creds.registered;
+      log(`🔌 انقطع اتصال واتساب${status ? ` (الكود ${status})` : ''}.`);
+
+      if (shuttingDown) return;
+      if (status === DisconnectReason.loggedOut && registered) {
+        log('⛔ الجلسة منتهية أو تم تسجيل الخروج. احذف auth_info واربط الحساب من جديد.');
+        return;
       }
+
+      log('⏳ إعادة الاتصال بعد 5 ثوانٍ...');
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        start().catch(err => log(`❌ فشل بدء الاتصال: ${err.message}`));
+      }, 5000);
     }
   });
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+  currentSocket.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
     for (const message of messages) {
       try {
         await handleMessage(message);
       } catch (error) {
-        logger.error({ err: error }, 'Message handling failed');
+        log(`❌ خطأ أثناء معالجة رسالة: ${error.message}`);
       }
     }
   });
 }
 
-process.on('SIGINT', () => {
-  logger.info('Shutting down...');
+function shutdown() {
+  shuttingDown = true;
+  if (pairingTimer) clearTimeout(pairingTimer);
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  log('👋 إيقاف البوت...');
   process.exit(0);
-});
-process.on('SIGTERM', () => process.exit(0));
+}
 
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
+
+log('🚀 بدأ تشغيل بوت جمع جهات الاتصال...');
+log(`📱 حساب الربط: ${BOT_NUMBER ? '+' + BOT_NUMBER : 'غير مضبوط في BOT_NUMBER'}`);
 start().catch(error => {
-  logger.fatal({ err: error }, 'Bot startup failed');
-  process.exit(1);
+  log(`❌ فشل تشغيل البوت: ${error.message}`);
+  // Keep the hosting process alive and retry transient startup errors.
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    start().catch(err => log(`❌ فشل إعادة التشغيل: ${err.message}`));
+  }, 10000);
 });
