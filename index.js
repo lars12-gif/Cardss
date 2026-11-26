@@ -2,7 +2,8 @@ const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
-  fetchLatestBaileysVersion
+  fetchLatestBaileysVersion,
+  jidNormalizedUser
 } = require('@whiskeysockets/baileys');
 const Database = require('better-sqlite3');
 const pino = require('pino');
@@ -10,7 +11,7 @@ const fs = require('fs');
 const path = require('path');
 
 // ==========================================
-// 1. تنظيف اللوق من ضجيج libsignal (Bad MAC / SessionEntry)
+// 1. تنظيف اللوق من ضجيج التشفير والجلسات
 // ==========================================
 const noisyPatterns = [
   'Bad MAC',
@@ -52,7 +53,7 @@ console.warn = (...args) => {
 };
 
 // ==========================================
-// 2. الإعدادات وقاعدة البيانات الدائمة
+// 2. قاعدة البيانات الدائمة (SQLite)
 // ==========================================
 const PHONE_NUMBER = (process.env.PHONE_NUMBER || '9647703270534').replace(/\D/g, '');
 
@@ -77,23 +78,22 @@ const getCountStmt = db.prepare(`SELECT COUNT(*) AS total FROM contacts`);
 const getAllPhonesStmt = db.prepare(`SELECT phone FROM contacts ORDER BY id ASC`);
 const clearAllStmt = db.prepare(`DELETE FROM contacts`);
 
-// تتبع معرفات الرسائل التي أرسلها البوت لتجنب الرد على نفسه
 const botSentIds = new Set();
 
 async function sendBotMessage(sock, jid, content, options = {}) {
   const sent = await sock.sendMessage(jid, content, options);
   if (sent?.key?.id) {
     botSentIds.add(sent.key.id);
-    if (botSentIds.size > 500) {
-      const firstKey = botSentIds.values().next().value;
-      botSentIds.delete(firstKey);
+    if (botSentIds.size > 1000) {
+      const first = botSentIds.values().next().value;
+      botSentIds.delete(first);
     }
   }
   return sent;
 }
 
 // ==========================================
-// 3. دوال معالجة الأرقام والبطاقات والرسائل
+// 3. دوال معالجة الأرقام والبطاقات والنصوص العربية
 // ==========================================
 function normalizePhone(rawPhone) {
   if (!rawPhone) return null;
@@ -103,6 +103,17 @@ function normalizePhone(rawPhone) {
   }
   cleaned = cleaned.replace(/^\+/, '');
   return cleaned.length >= 7 ? cleaned : null;
+}
+
+function normalizeArabicCommand(text) {
+  if (!text) return '';
+  return text
+    .trim()
+    .replace(/[\u064B-\u065F\u0670]/g, '') // إزالة التشكيل
+    .replace(/[إأآا]/g, 'ا')
+    .replace(/ى/g, 'ي')
+    .replace(/ة/g, 'ه')
+    .replace(/\s+/g, ' ');
 }
 
 function parseSingleVCard(vcardStr) {
@@ -126,23 +137,32 @@ function parseSingleVCard(vcardStr) {
 
 function unwrapMessage(msgContent) {
   let m = msgContent;
-  while (
-    m?.ephemeralMessage?.message ||
-    m?.viewOnceMessage?.message ||
-    m?.viewOnceMessageV2?.message ||
-    m?.documentWithCaptionMessage?.message
-  ) {
-    m =
-      m.ephemeralMessage?.message ||
-      m.viewOnceMessage?.message ||
-      m.viewOnceMessageV2?.message ||
-      m.documentWithCaptionMessage?.message;
+  let guard = 0;
+  while (m && guard < 8) {
+    guard++;
+    if (m.ephemeralMessage?.message) {
+      m = m.ephemeralMessage.message;
+    } else if (m.viewOnceMessage?.message) {
+      m = m.viewOnceMessage.message;
+    } else if (m.viewOnceMessageV2?.message) {
+      m = m.viewOnceMessageV2.message;
+    } else if (m.viewOnceMessageV2Extension?.message) {
+      m = m.viewOnceMessageV2Extension.message;
+    } else if (m.documentWithCaptionMessage?.message) {
+      m = m.documentWithCaptionMessage.message;
+    } else if (m.editedMessage?.message) {
+      m = m.editedMessage.message;
+    } else {
+      break;
+    }
   }
   return m;
 }
 
-function detectMessageType(m) {
-  if (!m) return 'فارغة / غير معروفة';
+function detectMessageType(m, msg) {
+  if (!m) {
+    return msg?.messageStubType ? `إشعار نظام (${msg.messageStubType})` : 'رسالة غير مفكوكة / نظام';
+  }
   if (m.contactMessage) return 'بطاقة اتصال (Contact)';
   if (m.contactsArrayMessage) return 'بطاقات اتصال متعددة (Multi Contact)';
   if (m.conversation || m.extendedTextMessage) return 'رسالة نصية';
@@ -192,22 +212,24 @@ function getMessageText(m) {
     m.imageMessage?.caption ||
     m.videoMessage?.caption ||
     m.documentMessage?.caption ||
+    m.buttonsResponseMessage?.selectedDisplayText ||
+    m.listResponseMessage?.title ||
     ''
   ).trim();
 }
 
-function formatJidDisplay(jid) {
-  if (!jid) return 'غير معروف';
-  return jid.split('@')[0].split(':')[0];
+function cleanId(jid) {
+  if (!jid) return '';
+  return String(jid).split('@')[0].split(':')[0];
 }
 
 function logIncomingMessage({ chatId, senderId, isGroup, fromMe, typeLabel, preview, statusNote }) {
   const timeStr = new Date().toLocaleTimeString('ar-IQ', { hour12: false });
-  const place = isGroup ? `مجموعة (${formatJidDisplay(chatId)})` : `خاص (${formatJidDisplay(chatId)})`;
-  const sender = fromMe ? `أنت / البوت (${formatJidDisplay(senderId)})` : formatJidDisplay(senderId);
+  const place = isGroup ? `مجموعة (${cleanId(chatId)})` : `خاص (${cleanId(chatId)})`;
+  const sender = fromMe ? `أنت / البوت (${cleanId(senderId)})` : cleanId(senderId);
 
   const lines = [
-    `────────────────────────────────────────`,
+    `----------------------------------------`,
     `📩 رسالة واردة [${timeStr}]`,
     `• المكان  : ${place}`,
     `• المرسل  : ${sender}`,
@@ -215,21 +237,28 @@ function logIncomingMessage({ chatId, senderId, isGroup, fromMe, typeLabel, prev
   ];
   if (preview) lines.push(`• المحتوى : ${preview}`);
   if (statusNote) lines.push(`• المعالجة: ${statusNote}`);
-  lines.push(`────────────────────────────────────────`);
+  lines.push(`----------------------------------------`);
 
   origLog(lines.join('\n'));
 }
 
-async function isSenderGroupAdmin(sock, groupJid, senderJid, fromMe) {
+async function isSenderGroupAdmin(sock, groupJid, senderJid, altJid, fromMe) {
   if (fromMe) return true;
   try {
     const metadata = await sock.groupMetadata(groupJid);
-    const senderNum = formatJidDisplay(senderJid);
+    const candidateIds = new Set(
+      [senderJid, altJid, cleanId(senderJid), cleanId(altJid)]
+        .filter(Boolean)
+        .map((v) => String(v))
+    );
+
     const participant = metadata.participants.find((p) => {
-      const pNum = formatJidDisplay(p.id);
-      const pLidNum = p.lid ? formatJidDisplay(p.lid) : '';
-      return p.id === senderJid || p.lid === senderJid || (senderNum && (pNum === senderNum || pLidNum === senderNum));
+      const pIds = [p.id, p.lid, p.jid, p.phoneNumber, cleanId(p.id), cleanId(p.lid), cleanId(p.phoneNumber)]
+        .filter(Boolean)
+        .map((v) => String(v));
+      return pIds.some((id) => candidateIds.has(id));
     });
+
     return Boolean(participant && (participant.admin === 'admin' || participant.admin === 'superadmin'));
   } catch {
     return false;
@@ -248,6 +277,8 @@ async function startBot() {
     auth: state,
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
+    syncFullHistory: false,
+    markOnlineOnConnect: true,
     browser: ['Ubuntu', 'Chrome', '20.0.04']
   });
 
@@ -275,7 +306,8 @@ async function startBot() {
     const { connection, lastDisconnect } = update;
 
     if (connection === 'open') {
-      origLog('✅ تم الاتصال بواتساب بنجاح وجاهز لاستقبال الرسائل والأوامر.');
+      const userId = sock.user?.id ? jidNormalizedUser(sock.user.id) : PHONE_NUMBER;
+      origLog(`✅ تم الاتصال بواتساب بنجاح (${cleanId(userId)}) — بانتظار الرسائل والأوامر.`);
     }
 
     if (connection === 'close') {
@@ -291,19 +323,17 @@ async function startBot() {
   });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
+    if (!Array.isArray(messages)) return;
 
     for (const msg of messages) {
       try {
-        if (!msg.key?.id) continue;
+        if (!msg?.key?.id) continue;
         if (botSentIds.has(msg.key.id)) continue;
 
         const chatId = msg.key.remoteJid;
         if (!chatId || chatId === 'status@broadcast') continue;
 
         const m = unwrapMessage(msg.message);
-        if (!m) continue;
-
         const isGroup = chatId.endsWith('@g.us');
         const fromMe = Boolean(msg.key.fromMe);
         const senderId = fromMe
@@ -311,20 +341,22 @@ async function startBot() {
           : isGroup
             ? msg.key.participant || chatId
             : chatId;
+        const altJid = msg.key.participantAlt || msg.key.remoteJidAlt || '';
 
-        const typeLabel = detectMessageType(m);
+        const typeLabel = detectMessageType(m, msg);
         const body = getMessageText(m);
+        const cmd = normalizeArabicCommand(body);
         const extractedContacts = extractContactsFromMessage(m);
 
         let preview = '';
         if (body) {
-          preview = body.length > 90 ? `${body.slice(0, 90)}...` : body;
+          preview = body.length > 100 ? `${body.slice(0, 100)}...` : body;
         } else if (extractedContacts.length > 0) {
           preview = extractedContacts.map((c) => `${c.name} (${c.phone})`).join(' ، ');
         }
 
-        // --- 1. الأوامر (تعمل من أي رقم ومن رقم البوت نفسه أيضاً) ---
-        if (body === '$مساعدة') {
+        // --- 1. الأوامر ---
+        if (cmd === '$مساعده') {
           const helpText = [
             '📋 *قائمة أوامر البوت:*',
             '• *$احسب* : عرض العدد الكلي للأرقام المسجلة.',
@@ -336,11 +368,19 @@ async function startBot() {
           ].join('\n');
 
           await sendBotMessage(sock, chatId, { text: helpText }, { quoted: msg });
-          logIncomingMessage({ chatId, senderId, isGroup, fromMe, typeLabel, preview, statusNote: 'نُفّذ أمر $مساعدة' });
+          logIncomingMessage({
+            chatId,
+            senderId,
+            isGroup,
+            fromMe,
+            typeLabel,
+            preview,
+            statusNote: `نُفّذ أمر $مساعدة (نوع الحدث: ${type})`
+          });
           continue;
         }
 
-        if (body === '$احسب') {
+        if (cmd === '$احسب') {
           const { total } = getCountStmt.get();
           await sendBotMessage(
             sock,
@@ -360,7 +400,7 @@ async function startBot() {
           continue;
         }
 
-        if (body === '$ناتج') {
+        if (cmd === '$ناتج') {
           const rows = getAllPhonesStmt.all();
           if (rows.length === 0) {
             await sendBotMessage(
@@ -410,7 +450,7 @@ async function startBot() {
           continue;
         }
 
-        if (body === '$مسح') {
+        if (cmd === '$مسح') {
           if (!isGroup) {
             await sendBotMessage(
               sock,
@@ -430,7 +470,7 @@ async function startBot() {
             continue;
           }
 
-          const admin = await isSenderGroupAdmin(sock, chatId, senderId, fromMe);
+          const admin = await isSenderGroupAdmin(sock, chatId, senderId, altJid, fromMe);
           if (!admin) {
             await sendBotMessage(
               sock,
@@ -510,7 +550,7 @@ async function startBot() {
           continue;
         }
 
-        // --- 3. تسجيل أي رسالة أخرى تصل بشكل مرتب في اللوق ---
+        // --- 3. تسجيل كل رسالة تصل بشكل مرتب في اللوق ---
         logIncomingMessage({
           chatId,
           senderId,
@@ -518,7 +558,7 @@ async function startBot() {
           fromMe,
           typeLabel,
           preview,
-          statusNote: 'تمت القراءة والتعرف على الرسالة'
+          statusNote: `تمت قراءة الرسالة (حدث: ${type})`
         });
       } catch (err) {
         origError('❌ خطأ أثناء معالجة الرسالة:', err?.message || err);
