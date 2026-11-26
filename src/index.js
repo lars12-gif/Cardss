@@ -6,7 +6,7 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import { extractPhonesFromMessage } from './vcard.js';
-import { readChat, writeChat, clearChat } from './store.js';
+import { readChat, writeChat, addNumbers, clearChat } from './store.js';
 
 const BOT_NUMBER = String(process.env.BOT_NUMBER || '').replace(/\D/g, '');
 const DEFAULT_COUNTRY_CODE = String(process.env.DEFAULT_COUNTRY_CODE || '964').replace(/\D/g, '');
@@ -46,15 +46,9 @@ async function handleIncoming(sock, msg) {
 
   const phones = extractPhonesFromMessage(msg, DEFAULT_COUNTRY_CODE);
   if (phones.length) {
-    const data = await readChat(jid);
-    const before = new Set(data.numbers);
-    const added = phones.filter(number => !before.has(number));
-    const merged = [...before, ...added].slice(0, MAX_CONTACTS);
-    const overflow = Math.max(0, before.size + added.length - MAX_CONTACTS);
-    const duplicatesRemoved = data.duplicatesRemoved + (phones.length - added.length);
-    await writeChat(jid, merged, duplicatesRemoved);
-    let note = `تم استلام بطاقة جهة اتصال.\nأُضيف: ${merged.length - before.size}\nالمجموع المحفوظ: ${merged.length}/${MAX_CONTACTS}`;
-    if (overflow) note += `\nتم تجاهل ${overflow} رقم بسبب بلوغ الحد الأعلى.`;
+    const result = await addNumbers(jid, phones, MAX_CONTACTS);
+    let note = `تم استلام بطاقة جهة اتصال.\nأُضيف: ${result.added}\nالمجموع المحفوظ: ${result.total}/${MAX_CONTACTS}`;
+    if (result.overflow) note += `\nتم تجاهل ${result.overflow} رقم بسبب بلوغ الحد الأعلى.`;
     await sendText(sock, jid, note, msg);
     return;
   }
@@ -163,7 +157,7 @@ async function startBot() {
             startBot().catch(err => logger.error({ err }, 'فشل إعادة التشغيل'));
           }, 5_000);
         } else if (loggedOut) {
-          logger.error('الجلسة انتهت. احذف مجلد .auth ثم أعد التشغيل لطلب اقتران جديد.');
+          logger.error('الجلسة غير مسجلة حالياً. لا تحذف .auth مباشرة؛ خذ نسخة احتياطية أولاً، ثم أعد الاقتران فقط إذا تأكدت أن واتساب ألغى ربط الجهاز.');
           isStarting = false;
         }
       }
@@ -200,5 +194,5 @@ process.on('unhandledRejection', error => logger.error({ err: error }, 'unhandle
 process.on('SIGINT', () => { logger.info('إيقاف البوت...'); process.exit(0); });
 process.on('SIGTERM', () => { logger.info('إيقاف البوت...'); process.exit(0); });
 
-logger.info(`WA vCard Bot v2.0.0 | الحد الأعلى ${MAX_CONTACTS} | رمز الدولة ${DEFAULT_COUNTRY_CODE}`);
+logger.info(`WA vCard Bot v2.1.0 | الحد الأعلى ${MAX_CONTACTS} | رمز الدولة ${DEFAULT_COUNTRY_CODE}`);
 startBot();
