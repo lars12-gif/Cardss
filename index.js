@@ -98,13 +98,37 @@ function setActiveGroupId(groupJid) {
   setSettingStmt.run({ key: 'active_group_id', value: groupJid });
 }
 
+// إدخال مجموعة كبيرة من الأرقام دفعة واحدة بسرعة وأمان
+const saveContactsBatch = db.transaction((items, senderId, groupId) => {
+  const results = [];
+  for (const item of items) {
+    const existing = getContactByPhoneStmt.get(item.phone);
+    if (existing) {
+      results.push({ phone: item.phone, name: item.name, status: 'duplicate' });
+    } else {
+      const res = insertContactStmt.run({
+        phone: item.phone,
+        name: item.name,
+        added_by: senderId,
+        group_id: groupId
+      });
+      if (res.changes > 0) {
+        results.push({ phone: item.phone, name: item.name, status: 'added' });
+      } else {
+        results.push({ phone: item.phone, name: item.name, status: 'duplicate' });
+      }
+    }
+  }
+  return results;
+});
+
 const botSentIds = new Set();
 
 async function sendBotMessage(sock, jid, content, options = {}) {
   const sent = await sock.sendMessage(jid, content, options);
   if (sent?.key?.id) {
     botSentIds.add(sent.key.id);
-    if (botSentIds.size > 1000) {
+    if (botSentIds.size > 2000) {
       const first = botSentIds.values().next().value;
       botSentIds.delete(first);
     }
@@ -136,22 +160,52 @@ function normalizeArabicCommand(text) {
     .replace(/\s+/g, ' ');
 }
 
-function parseSingleVCard(vcardStr) {
+// تقسيم نص يحتوي على بطاقة vCard واحدة أو عدة بطاقات مدموجة (حتى 50+ رقم)
+function parseVCardBundle(rawText) {
   const results = [];
-  if (!vcardStr || typeof vcardStr !== 'string') return results;
+  if (!rawText || typeof rawText !== 'string') return results;
 
-  const fnMatch = vcardStr.match(/FN[^:]*:([^\r\n]+)/i);
-  const name = fnMatch ? fnMatch[1].trim() : 'بدون اسم';
+  // فك الأسطر المطوية في معيار vCard (CRLF + مسافة أو تبويب)
+  const unfolded = rawText.replace(/\r?\n[ \t]/g, '');
 
-  const telMatches = [...vcardStr.matchAll(/TEL[^:]*:([^\r\n]+)/gi)];
-  for (const match of telMatches) {
-    const waidMatch = match[0].match(/waid=(\d+)/i);
-    const rawNum = waidMatch ? waidMatch[1] : match[1];
-    const phone = normalizePhone(rawNum);
-    if (phone) {
-      results.push({ name, phone });
+  const beginMatches = [...unfolded.matchAll(/BEGIN:VCARD/gi)];
+  const blocks = [];
+
+  if (beginMatches.length > 0) {
+    for (let i = 0; i < beginMatches.length; i++) {
+      const start = beginMatches[i].index;
+      const end = i + 1 < beginMatches.length ? beginMatches[i + 1].index : unfolded.length;
+      blocks.push(unfolded.slice(start, end));
+    }
+  } else {
+    blocks.push(unfolded);
+  }
+
+  for (const block of blocks) {
+    const fnMatch = block.match(/^(?:item\d+\.)?FN(?:;[^:\r\n]*)?:([^\r\n]+)/im);
+    const nMatch = block.match(/^(?:item\d+\.)?N(?:;[^:\r\n]*)?:([^\r\n]+)/im);
+    let name = 'بدون اسم';
+
+    if (fnMatch && fnMatch[1].trim()) {
+      name = fnMatch[1].trim();
+    } else if (nMatch && nMatch[1].trim()) {
+      const parts = nMatch[1].split(';').map((s) => s.trim()).filter(Boolean);
+      if (parts.length > 0) name = parts.join(' ');
+    }
+
+    const telMatches = [...block.matchAll(/^(?:item\d+\.)?TEL(?:;[^:\r\n]*)?:([^\r\n]+)/gim)];
+    for (const match of telMatches) {
+      const fullLine = match[0];
+      const valuePart = match[1] || '';
+      const waidMatch = fullLine.match(/waid=(\d+)/i);
+      const rawNum = waidMatch ? waidMatch[1] : valuePart;
+      const phone = normalizePhone(rawNum);
+      if (phone) {
+        results.push({ name, phone });
+      }
     }
   }
+
   return results;
 }
 
@@ -202,13 +256,13 @@ function extractContactsFromMessage(m) {
   if (!m) return extracted;
 
   if (m.contactMessage?.vcard) {
-    extracted.push(...parseSingleVCard(m.contactMessage.vcard));
+    extracted.push(...parseVCardBundle(m.contactMessage.vcard));
   }
 
   if (m.contactsArrayMessage?.contacts?.length) {
     for (const c of m.contactsArrayMessage.contacts) {
       if (c.vcard) {
-        extracted.push(...parseSingleVCard(c.vcard));
+        extracted.push(...parseVCardBundle(c.vcard));
       } else if (c.displayName || c.phoneNumber) {
         const phone = normalizePhone(c.phoneNumber);
         if (phone) {
@@ -221,7 +275,21 @@ function extractContactsFromMessage(m) {
     }
   }
 
-  return extracted;
+  // إذا كانت رسالة نصية تحتوي على بطاقات vCard مدموجة يدوياً
+  const textBody = m.conversation || m.extendedTextMessage?.text || '';
+  if (/BEGIN:VCARD/i.test(textBody)) {
+    extracted.push(...parseVCardBundle(textBody));
+  }
+
+  // إزالة التكرار داخل نفس الرسالة الواحدة قبل الحفظ
+  const uniqueMap = new Map();
+  for (const item of extracted) {
+    if (!uniqueMap.has(item.phone)) {
+      uniqueMap.set(item.phone, item);
+    }
+  }
+
+  return [...uniqueMap.values()];
 }
 
 function getMessageText(m) {
@@ -331,8 +399,8 @@ async function startBot() {
       origLog(`✅ تم الاتصال بواتساب بنجاح (${cleanId(userId)})`);
       origLog(
         activeGrp
-          ? `🎯 المجموعة المفعّلة حالياً: ${cleanId(activeGrp)}`
-          : `ℹ️ لم يتم تحديد مجموعة بعد. أرسل $تنصيب داخل المجموعة المطلوبة.`
+          ? `🎯 المجموعة المنصّبة حالياً: ${cleanId(activeGrp)}`
+          : `⛔ لا توجد مجموعة منصّبة حالياً — لن تُقرأ أي جهات اتصال حتى يتم إرسال $تنصيب داخل المجموعة المطلوبة.`
       );
     }
 
@@ -378,10 +446,13 @@ async function startBot() {
         if (body) {
           preview = body.length > 100 ? `${body.slice(0, 100)}...` : body;
         } else if (extractedContacts.length > 0) {
-          preview = extractedContacts.map((c) => `${c.name} (${c.phone})`).join(' ، ');
+          preview = `${extractedContacts.length} رقم (${extractedContacts
+            .slice(0, 3)
+            .map((c) => c.phone)
+            .join(' ، ')}${extractedContacts.length > 3 ? ' ...' : ''})`;
         }
 
-        // --- أمر $تنصيب لتحديد المجموعة المفعّلة ---
+        // --- أمر $تنصيب لتحديد المجموعة المنصّبة ---
         if (cmd === '$تنصيب') {
           if (!isGroup) {
             await sendBotMessage(
@@ -433,7 +504,7 @@ async function startBot() {
             sock,
             chatId,
             {
-              text: `✅ تم تنصيب البوت وتفعيله في هذه المجموعة (*${groupSubject}*).\nلن يستجيب البوت في أي مجموعة أخرى.`
+              text: `✅ تم تنصيب البوت وتفعيله في هذه المجموعة (*${groupSubject}*).\nالآن يقرأ البوت بطاقات الاتصال من جميع الأعضاء هنا فقط ولن يعمل في أي مجموعة أخرى.`
             },
             { quoted: msg }
           );
@@ -444,13 +515,69 @@ async function startBot() {
             fromMe,
             typeLabel,
             preview,
-            statusNote: `تم تعيين المجموعة المفعّلة: ${groupSubject}`
+            statusNote: `تم تنصيب المجموعة: ${groupSubject}`
           });
           continue;
         }
 
-        // --- التحقق من أن الرسالة داخل المجموعة المفعّلة إذا كان هناك مجموعة محددة ---
         const activeGroupId = getActiveGroupId();
+
+        // --- عدم قراءة أو معالجة أي جهات اتصال إلا إذا كانت داخل المجموعة المنصّبة ---
+        if (extractedContacts.length > 0) {
+          if (!isGroup || !activeGroupId || chatId !== activeGroupId) {
+            logIncomingMessage({
+              chatId,
+              senderId,
+              isGroup,
+              fromMe,
+              typeLabel,
+              preview,
+              statusNote: !activeGroupId
+                ? 'تم تجاهل جهات الاتصال (لم يتم تنفيذ $تنصيب بعد)'
+                : 'تم تجاهل جهات الاتصال (المجموعة ليست المنصّبة)'
+            });
+            continue;
+          }
+
+          const batchResults = saveContactsBatch(extractedContacts, senderId, chatId);
+          const addedList = batchResults.filter((r) => r.status === 'added');
+          const dupList = batchResults.filter((r) => r.status === 'duplicate');
+
+          let replyText = '';
+          if (batchResults.length === 1) {
+            const single = batchResults[0];
+            replyText =
+              single.status === 'added'
+                ? `✅ تم حفظ الرقم *${single.phone}* باسم: *${single.name}*`
+                : `ℹ️ الرقم *${single.phone}* (${single.name}) مسجل مسبقاً.`;
+          } else {
+            const lines = [
+              `📥 تمت معالجة *${batchResults.length}* رقم من البطاقة:`,
+              `✅ مضاف جديد: *${addedList.length}*`,
+              `ℹ️ مكرر مسبقاً: *${dupList.length}*`
+            ];
+            if (addedList.length > 0 && addedList.length <= 25) {
+              lines.push('', '*الأرقام المضافة:*', ...addedList.map((x) => `• ${x.phone} (${x.name})`));
+            } else if (addedList.length > 25) {
+              lines.push('', `• تم حفظ ${addedList.length} رقم جديد بنجاح.`);
+            }
+            replyText = lines.join('\n');
+          }
+
+          await sendBotMessage(sock, chatId, { text: replyText }, { quoted: msg });
+          logIncomingMessage({
+            chatId,
+            senderId,
+            isGroup,
+            fromMe,
+            typeLabel,
+            preview,
+            statusNote: `بطاقات اتصال (مضاف: ${addedList.length} ، مكرر: ${dupList.length})`
+          });
+          continue;
+        }
+
+        // --- تجاهل أوامر المجموعات في المجموعات غير المنصّبة ---
         if (isGroup && activeGroupId && chatId !== activeGroupId) {
           logIncomingMessage({
             chatId,
@@ -459,12 +586,12 @@ async function startBot() {
             fromMe,
             typeLabel,
             preview,
-            statusNote: 'متجاهل (المجموعة غير مفعّلة)'
+            statusNote: 'متجاهل (المجموعة غير منصّبة)'
           });
           continue;
         }
 
-        // --- بقية الأوامر ---
+        // --- الأوامر (تعمل لأي عضو داخل المجموعة المنصّبة وفي الخاص) ---
         if (cmd === '$مساعده') {
           const helpText = [
             '📋 *قائمة أوامر البوت:*',
@@ -474,7 +601,7 @@ async function startBot() {
             '• *$مسح* : حذف الأرقام المسجلة (للإدارة فقط).',
             '• *$مساعدة* : عرض قائمة الأوامر ووظائفها.',
             '',
-            '💡 لإضافة رقم، أرسل بطاقة جهة اتصال (Contact / vCard) داخل المجموعة المفعّلة.'
+            '💡 أرسل بطاقة جهة اتصال (مفردة أو مدموجة بعدة أرقام) داخل المجموعة المنصّبة لحفظها.'
           ].join('\n');
 
           await sendBotMessage(sock, chatId, { text: helpText }, { quoted: msg });
@@ -485,7 +612,7 @@ async function startBot() {
             fromMe,
             typeLabel,
             preview,
-            statusNote: `نُفّذ أمر $مساعدة (نوع الحدث: ${type})`
+            statusNote: 'نُفّذ أمر $مساعدة'
           });
           continue;
         }
@@ -615,47 +742,6 @@ async function startBot() {
             typeLabel,
             preview,
             statusNote: `نُفّذ أمر $مسح (حُذف ${info.changes} رقم)`
-          });
-          continue;
-        }
-
-        // --- استقبال بطاقات الاتصال داخل المجموعة المفعّلة ---
-        if (isGroup && extractedContacts.length > 0) {
-          const statusLines = [];
-          let addedCount = 0;
-          let dupCount = 0;
-
-          for (const item of extractedContacts) {
-            const exists = getContactByPhoneStmt.get(item.phone);
-            if (exists) {
-              dupCount++;
-              statusLines.push(`ℹ️ الرقم *${item.phone}* (${item.name}) مسجل مسبقاً.`);
-            } else {
-              const res = insertContactStmt.run({
-                phone: item.phone,
-                name: item.name,
-                added_by: senderId,
-                group_id: chatId
-              });
-              if (res.changes > 0) {
-                addedCount++;
-                statusLines.push(`✅ تم حفظ الرقم *${item.phone}* باسم: *${item.name}*`);
-              } else {
-                dupCount++;
-                statusLines.push(`ℹ️ الرقم *${item.phone}* (${item.name}) مسجل مسبقاً.`);
-              }
-            }
-          }
-
-          await sendBotMessage(sock, chatId, { text: statusLines.join('\n') }, { quoted: msg });
-          logIncomingMessage({
-            chatId,
-            senderId,
-            isGroup,
-            fromMe,
-            typeLabel,
-            preview,
-            statusNote: `بطاقة اتصال (مضاف: ${addedCount} ، مكرر: ${dupCount})`
           });
           continue;
         }
